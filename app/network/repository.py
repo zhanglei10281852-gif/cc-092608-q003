@@ -98,6 +98,15 @@ class NetworkRepository:
     def sample_by_key(self, sample_key: str) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM experience_samples WHERE sample_key=?", (sample_key,)).fetchone()
 
+    def batch_by_key(self, batch_key: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM sample_batches WHERE batch_key=?", (batch_key,)).fetchone()
+
+    def record_batch(self, batch_key: str, item_count: int, response_json: str, created_at: str) -> None:
+        self.connection.execute(
+            "INSERT INTO sample_batches(batch_key,item_count,response_json,created_at) VALUES(?,?,?,?)",
+            (batch_key, item_count, response_json, created_at),
+        )
+
     def sample_by_id(self, sample_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM experience_samples WHERE id=?", (sample_id,)).fetchone()
 

@@ -199,6 +199,13 @@ CREATE TABLE IF NOT EXISTS operation_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(resource_type,resource_id,id);
+CREATE TABLE IF NOT EXISTS sample_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_key TEXT NOT NULL UNIQUE,
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 '''
 
 
