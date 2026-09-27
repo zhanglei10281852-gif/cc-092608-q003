@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -12,6 +13,15 @@ from app.database import get_connection, transaction
 from app.network.repository import NetworkRepository
 from app.network.rules import DEFAULT_RULES, allocation_for, canonical_rules, judge_quality
 from app.network.schema import ensure_network_schema
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSample:
+    scenario_id: int
+    app: sqlite3.Row
+    segment_id: int | None
+    observed_at: str
+    digest: str
 
 
 class NetworkAccelerationService:
@@ -123,46 +133,66 @@ class NetworkAccelerationService:
             return dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
 
     def ingest_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
-        scenario = self._scenario(payload["scenario_code"])
-        app = self._application(payload["app_code"])
-        segment = None
-        if payload.get("segment_code"):
-            segment = self.repository.segment_by_code(scenario["id"], payload["segment_code"])
-            if segment is None:
-                raise NotFoundError("场景区段不存在")
-        try:
-            observed = to_storage(from_storage(payload["observed_at"]))
-        except ValueError as exc:
-            raise ValidationError("观测时间格式不正确") from exc
-        digest = request_fingerprint(payload)
+        prepared = self._prepare_sample(payload)
         existing = self.repository.sample_by_key(payload["sample_key"])
         if existing is not None:
-            if existing["payload_digest"] != digest:
+            if existing["payload_digest"] != prepared.digest:
                 raise ConflictError("相同 sample_key 对应了不同观测内容")
             return self._sample_result(existing["id"])
         now = to_storage(self.clock.now())
-        policy = self.repository.effective_policy(scenario["id"], now)
-        rules = json.loads(policy["rules_json"]) if policy else DEFAULT_RULES
-        decision = judge_quality(payload, dict(app), rules)
         with transaction(immediate=True) as connection:
-            cursor = connection.execute(
-                "INSERT INTO experience_samples(sample_key,scenario_id,segment_id,app_id,subscriber_hash,device_class,train_speed_kmh,latency_ms,packet_loss,downlink_mbps,uplink_mbps,observed_at,received_at,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (payload["sample_key"], scenario["id"], segment["id"] if segment else None, app["id"], payload["subscriber_hash"], payload["device_class"], payload["train_speed_kmh"], payload["latency_ms"], payload["packet_loss"], payload["downlink_mbps"], payload["uplink_mbps"], observed, now, digest),
-            )
-            incident_id = None
-            if decision.degraded:
-                incident = connection.execute(
-                    "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at) VALUES(?,?,?,?,?,?,?)",
-                    (cursor.lastrowid, scenario["id"], segment["id"] if segment else None, app["id"], decision.severity, json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True), now),
-                )
-                incident_id = incident.lastrowid
-            return {"sample_id": cursor.lastrowid, "incident_id": incident_id, "quality": decision.as_dict()}
+            return self._insert_sample(connection, payload, prepared, now)
 
     def ingest_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
-        results = []
-        for item in items:
-            results.append(self.ingest_sample(item))
-        return {"items": results, "accepted": len(results)}
+        if not items:
+            raise ValidationError("批量样本不能为空")
+        keys = [item.get("sample_key") for item in items]
+        if len(keys) != len(set(keys)):
+            raise ValidationError("同一批次内 sample_key 不能重复")
+        # 写入前完成整批校验：场景、区段、应用、观测时间与内容指纹，任何一项不合法都不会落库
+        prepared = [
+            self._prepare_sample(item, context={"index": index, "sample_key": item.get("sample_key")})
+            for index, item in enumerate(items)
+        ]
+        batch_key = "batch-" + request_fingerprint({"items": items})
+        existing = self.repository.batch_by_key(batch_key)
+        if existing is not None:
+            return self._batch_replay(existing)
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = NetworkRepository(connection)
+            stored = repository.batch_by_key(batch_key)
+            if stored is not None:
+                return self._batch_replay(stored)
+            # 事务内先完成整批采样键校验，再统一写入，保证批次原子性
+            stored_samples = []
+            for index, item in enumerate(items):
+                row = repository.sample_by_key(item["sample_key"])
+                if row is not None and row["payload_digest"] != prepared[index].digest:
+                    raise ConflictError(
+                        "相同 sample_key 对应了不同观测内容",
+                        context={"index": index, "sample_key": item["sample_key"]},
+                    )
+                stored_samples.append(row)
+            results = []
+            for item, prep, row in zip(items, prepared, stored_samples):
+                if row is not None:
+                    incident = repository.incident_by_sample(row["id"])
+                    results.append({
+                        "sample_key": item["sample_key"],
+                        "sample_id": row["id"],
+                        "incident_id": incident["id"] if incident else None,
+                        "duplicate": True,
+                    })
+                    continue
+                result = self._insert_sample(connection, item, prep, now)
+                results.append({"sample_key": item["sample_key"], **result, "duplicate": False})
+            response = {"batch_id": batch_key, "accepted": len(results), "replayed": False, "items": results}
+            connection.execute(
+                "INSERT INTO sample_batches(batch_key,item_count,response_json,created_at) VALUES(?,?,?,?)",
+                (batch_key, len(items), json.dumps(response, ensure_ascii=False, sort_keys=True), now),
+            )
+            return response
 
     def start_acceleration(self, incident_id: int, actor: str) -> dict[str, Any]:
         incident = self.repository.incident_by_id(incident_id)
@@ -275,6 +305,49 @@ class NetworkAccelerationService:
         sample = self.repository.sample_by_id(sample_id)
         incident = self.repository.incident_by_sample(sample_id)
         return {"sample_id": sample_id, "incident_id": incident["id"] if incident else None, "duplicate": True, "sample": dict(sample)}
+
+    def _prepare_sample(self, payload: dict[str, Any], *, context: dict[str, Any] | None = None) -> _PreparedSample:
+        context = context or {}
+        scenario = self.repository.scenario_by_code(payload["scenario_code"])
+        if scenario is None:
+            raise NotFoundError("网络场景不存在", context=context)
+        app = self.repository.application_by_code(payload["app_code"])
+        if app is None:
+            raise NotFoundError("应用画像不存在", context=context)
+        segment_id = None
+        if payload.get("segment_code"):
+            segment = self.repository.segment_by_code(scenario["id"], payload["segment_code"])
+            if segment is None:
+                raise NotFoundError("场景区段不存在", context=context)
+            segment_id = segment["id"]
+        try:
+            observed = to_storage(from_storage(payload["observed_at"]))
+        except ValueError as exc:
+            raise ValidationError("观测时间格式不正确", context=context) from exc
+        return _PreparedSample(scenario["id"], app, segment_id, observed, request_fingerprint(payload))
+
+    def _insert_sample(self, connection: sqlite3.Connection, payload: dict[str, Any], prepared: _PreparedSample, now: str) -> dict[str, Any]:
+        policy = NetworkRepository(connection).effective_policy(prepared.scenario_id, now)
+        rules = json.loads(policy["rules_json"]) if policy else DEFAULT_RULES
+        decision = judge_quality(payload, dict(prepared.app), rules)
+        cursor = connection.execute(
+            "INSERT INTO experience_samples(sample_key,scenario_id,segment_id,app_id,subscriber_hash,device_class,train_speed_kmh,latency_ms,packet_loss,downlink_mbps,uplink_mbps,observed_at,received_at,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (payload["sample_key"], prepared.scenario_id, prepared.segment_id, prepared.app["id"], payload["subscriber_hash"], payload["device_class"], payload["train_speed_kmh"], payload["latency_ms"], payload["packet_loss"], payload["downlink_mbps"], payload["uplink_mbps"], prepared.observed_at, now, prepared.digest),
+        )
+        incident_id = None
+        if decision.degraded:
+            incident = connection.execute(
+                "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at) VALUES(?,?,?,?,?,?,?)",
+                (cursor.lastrowid, prepared.scenario_id, prepared.segment_id, prepared.app["id"], decision.severity, json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True), now),
+            )
+            incident_id = incident.lastrowid
+        return {"sample_id": cursor.lastrowid, "incident_id": incident_id, "quality": decision.as_dict()}
+
+    @staticmethod
+    def _batch_replay(row: sqlite3.Row) -> dict[str, Any]:
+        response = json.loads(row["response_json"])
+        response["replayed"] = True
+        return response
 
     def _scenario(self, code: str) -> sqlite3.Row:
         row = self.repository.scenario_by_code(code)

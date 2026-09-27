@@ -101,6 +101,9 @@ class NetworkRepository:
     def sample_by_id(self, sample_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM experience_samples WHERE id=?", (sample_id,)).fetchone()
 
+    def batch_by_key(self, batch_key: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM sample_batches WHERE batch_key=?", (batch_key,)).fetchone()
+
     def incident_by_sample(self, sample_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM quality_incidents WHERE sample_id=?", (sample_id,)).fetchone()
 

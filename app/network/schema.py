@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS experience_samples (
     payload_digest TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_samples_scene_time ON experience_samples(scenario_id,observed_at);
+CREATE TABLE IF NOT EXISTS sample_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_key TEXT NOT NULL UNIQUE,
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS quality_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_id INTEGER NOT NULL UNIQUE REFERENCES experience_samples(id) ON DELETE CASCADE,

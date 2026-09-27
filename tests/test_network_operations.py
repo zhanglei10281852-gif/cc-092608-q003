@@ -206,3 +206,80 @@ def test_demo_seed_and_summary(client):
     summary = client.get("/api/network/summary")
     assert summary.status_code == 200
     assert summary.json()["scenarios"]["active"] == 1
+
+
+def test_batch_ingest_is_atomic_and_replayable(client):
+    prepare(client)
+    connection = get_connection()
+
+    def counts():
+        row = connection.execute(
+            "SELECT (SELECT COUNT(*) FROM experience_samples),(SELECT COUNT(*) FROM quality_incidents)"
+        ).fetchone()
+        return int(row[0]), int(row[1])
+
+    healthy = sample_payload(sample_key="batch-000002", latency_ms=80, packet_loss=0.005, downlink_mbps=20, uplink_mbps=8)
+    items = [
+        sample_payload(sample_key="batch-000001"),
+        healthy,
+        sample_payload(sample_key="batch-000003"),
+    ]
+    first = client.post("/api/network/samples/batch", json={"items": items})
+    assert first.status_code == 202, first.text
+    body = first.json()
+    assert body["batch_id"]
+    assert body["replayed"] is False
+    assert body["accepted"] == 3
+    assert [item["sample_key"] for item in body["items"]] == ["batch-000001", "batch-000002", "batch-000003"]
+    sample_ids = {item["sample_key"]: item["sample_id"] for item in body["items"]}
+    incidents = {item["sample_key"]: item["incident_id"] for item in body["items"]}
+    assert incidents["batch-000001"] is not None
+    assert incidents["batch-000002"] is None
+    assert incidents["batch-000003"] is not None
+    assert counts() == (3, 2)
+    linked = connection.execute("SELECT sample_id FROM quality_incidents").fetchall()
+    assert {row["sample_id"] for row in linked} == {sample_ids["batch-000001"], sample_ids["batch-000003"]}
+
+    # 尾项引用未知应用：整批拒绝，前面合法项不得留下样本或质差事件
+    bad_tail = [
+        sample_payload(sample_key="batch-err-001"),
+        sample_payload(sample_key="batch-err-002", app_code="unknown-app"),
+    ]
+    rejected = client.post("/api/network/samples/batch", json={"items": bad_tail})
+    assert rejected.status_code == 404
+    assert counts() == (3, 2)
+    leftover = connection.execute("SELECT COUNT(*) FROM experience_samples WHERE sample_key LIKE 'batch-err-%'").fetchone()
+    assert int(leftover[0]) == 0
+
+    # 观测时间格式不合法同样整批拒绝
+    bad_time = client.post(
+        "/api/network/samples/batch",
+        json={"items": [sample_payload(sample_key="batch-err-003", observed_at="not-a-time")]},
+    )
+    assert bad_time.status_code == 422
+    assert counts() == (3, 2)
+
+    # 相同内容重试：复用原批次标识与逐项结果，数据库数量与事件关联不变
+    replay = client.post("/api/network/samples/batch", json={"items": items})
+    assert replay.status_code == 202
+    again = replay.json()
+    assert again["batch_id"] == body["batch_id"]
+    assert again["replayed"] is True
+    assert again["items"] == body["items"]
+    assert counts() == (3, 2)
+
+    # 采样键相同但内容不同：明确冲突且不落库
+    conflict = client.post(
+        "/api/network/samples/batch",
+        json={"items": [sample_payload(sample_key="batch-000001", latency_ms=999)]},
+    )
+    assert conflict.status_code == 409
+    assert counts() == (3, 2)
+
+    # 同一批次内采样键重复直接校验失败
+    duplicated = client.post(
+        "/api/network/samples/batch",
+        json={"items": [sample_payload(sample_key="batch-dup-01"), sample_payload(sample_key="batch-dup-01")]},
+    )
+    assert duplicated.status_code == 422
+    assert counts() == (3, 2)
